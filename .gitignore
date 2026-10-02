@@ -1,0 +1,12 @@
+*.o
+*.ko
+*.mod*
+.tmp_versions
+Module.symvers
+modules.order
+*.order
+user/kmodring_reader
+user/kmodring_bench
+user/kmodring_ioctl
+tests/kunit/kmodring_ring_test
+.DS_Store
