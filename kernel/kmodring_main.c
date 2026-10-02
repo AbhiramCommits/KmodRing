@@ -9,12 +9,13 @@
 #include <linux/poll.h>
 #include <linux/vmalloc.h>
 #include <linux/refcount.h>
+#include <linux/dma-mapping.h>
 #include "kmodring_uapi.h"
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("KmodRing Contributors");
-MODULE_DESCRIPTION("Lock-free ring buffer char device driver with mmap");
-MODULE_VERSION("0.1");
+MODULE_DESCRIPTION("Lock-free ring buffer char device driver with mmap and kthread producer");
+MODULE_VERSION("0.2");
 
 #define DEFAULT_SLOT_COUNT 1024
 #define DEFAULT_SLOT_SIZE  256
@@ -23,12 +24,26 @@ struct kmodring_ctx {
     refcount_t refcount;
     struct kmodring_hdr *hdr;
     void *ring_mem;
+    dma_addr_t dma_handle;
     size_t total_size;
+    bool is_dma;
     bool is_vmalloc;
 };
 
 static struct kmodring_ctx *global_ctx = NULL;
 static DEFINE_MUTEX(kmodring_mutex);
+
+char *alloc_mode = "pages";
+module_param(alloc_mode, charp, 0444);
+MODULE_PARM_DESC(alloc_mode, "Allocation mode: pages or dma");
+
+extern int kmodring_producer_init(struct kmodring_ctx *ctx);
+extern void kmodring_producer_exit(void);
+extern wait_queue_head_t *kmodring_get_wq(void);
+extern int kmodring_sysfs_init(void);
+extern void kmodring_sysfs_exit(void);
+extern void *kmodring_dma_alloc(size_t size, dma_addr_t *dma_handle);
+extern void kmodring_dma_free(size_t size, void *cpu_addr, dma_addr_t dma_handle);
 
 static vm_fault_t kmodring_vm_fault(struct vm_fault *vmf)
 {
@@ -80,8 +95,14 @@ static ssize_t kmodring_read(struct file *filp, char __user *buf, size_t len, lo
     head = smp_load_acquire(&hdr->producer.head);
     tail = hdr->consumer.tail;
 
-    if (tail == head)
-        return 0; // Empty
+    if (tail == head) {
+        if (filp->f_flags & O_NONBLOCK)
+            return -EAGAIN;
+        if (wait_event_interruptible(*(kmodring_get_wq()), smp_load_acquire(&hdr->producer.head) != hdr->consumer.tail))
+            return -ERESTARTSYS;
+        head = smp_load_acquire(&hdr->producer.head);
+        tail = hdr->consumer.tail;
+    }
 
     if (len < slot_size)
         return -EINVAL;
@@ -102,7 +123,8 @@ static __poll_t kmodring_poll(struct file *filp, struct poll_table_struct *wait)
     struct kmodring_hdr *hdr = ctx->hdr;
     __poll_t mask = 0;
 
-    // We will use wait queues in step 3. For now, return immediate readability if not empty
+    poll_wait(filp, kmodring_get_wq(), wait);
+
     if (smp_load_acquire(&hdr->producer.head) != hdr->consumer.tail) {
         mask |= EPOLLIN | EPOLLRDNORM;
     }
@@ -120,7 +142,10 @@ static int kmodring_mmap(struct file *filp, struct vm_area_struct *vma)
     vma->vm_ops = &kmodring_vm_ops;
     vma->vm_flags |= VM_DONTEXPAND | VM_DONTDUMP;
 
-    if (ctx->is_vmalloc) {
+    if (ctx->is_dma) {
+        if (dma_mmap_coherent(NULL, vma, ctx->ring_mem, ctx->dma_handle, size))
+            return -EAGAIN;
+    } else if (ctx->is_vmalloc) {
         struct page *page;
         unsigned long pfn;
         unsigned long off = vma->vm_pgoff << PAGE_SHIFT;
@@ -158,6 +183,19 @@ static long kmodring_ioctl(struct file *filp, unsigned int cmd, unsigned long ar
             return -EFAULT;
         break;
     }
+    case KMODRING_IOC_SETRATE: {
+        unsigned int new_rate;
+        if (copy_from_user(&new_rate, (void __user *)arg, sizeof(new_rate)))
+            return -EFAULT;
+        kmodring_set_rate(new_rate);
+        break;
+    }
+    case KMODRING_IOC_START:
+        // Already started by default
+        break;
+    case KMODRING_IOC_STOP:
+        kmodring_set_rate(0);
+        break;
     case KMODRING_IOC_STATS: {
         if (copy_to_user((void __user *)arg, hdr, sizeof(struct kmodring_hdr)))
             return -EFAULT;
@@ -185,6 +223,7 @@ static long kmodring_ioctl(struct file *filp, unsigned int cmd, unsigned long ar
 
         smp_store_release(&hdr->producer.head, head + 1);
         hdr->produced++;
+        wake_up_interruptible(kmodring_get_wq());
         break;
     }
     case KMODRING_IOC_RESET:
@@ -230,12 +269,23 @@ static int __init kmodring_init(void)
 
     refcount_set(&global_ctx->refcount, 1);
     global_ctx->total_size = total_size;
-    global_ctx->is_vmalloc = true;
 
-    global_ctx->ring_mem = vzalloc(total_size);
-    if (!global_ctx->ring_mem) {
-        ret = -ENOMEM;
-        goto err_free_ctx;
+    if (strcmp(alloc_mode, "dma") == 0) {
+        global_ctx->is_dma = true;
+        global_ctx->ring_mem = kmodring_dma_alloc(total_size, &global_ctx->dma_handle);
+        if (!global_ctx->ring_mem) {
+            pr_err("kmodring: failed to allocate dma coherent memory\n");
+            ret = -ENOMEM;
+            goto err_free_ctx;
+        }
+        memset(global_ctx->ring_mem, 0, total_size);
+    } else {
+        global_ctx->is_vmalloc = true;
+        global_ctx->ring_mem = vzalloc(total_size);
+        if (!global_ctx->ring_mem) {
+            ret = -ENOMEM;
+            goto err_free_ctx;
+        }
     }
 
     global_ctx->hdr = (struct kmodring_hdr *)global_ctx->ring_mem;
@@ -246,15 +296,30 @@ static int __init kmodring_init(void)
     global_ctx->hdr->producer.head = 0;
     global_ctx->hdr->consumer.tail = 0;
 
+    ret = kmodring_producer_init(global_ctx);
+    if (ret)
+        goto err_free_mem;
+
+    ret = kmodring_sysfs_init();
+    if (ret)
+        goto err_stop_prod;
+
     ret = misc_register(&kmodring_misc);
     if (ret)
-        goto err_free_vmalloc;
+        goto err_sysfs_exit;
 
-    pr_info("kmodring: loaded successfully at /dev/kmodring\n");
+    pr_info("kmodring: loaded successfully with alloc_mode=%s\n", alloc_mode);
     return 0;
 
-err_free_vmalloc:
-    vfree(global_ctx->ring_mem);
+err_sysfs_exit:
+    kmodring_sysfs_exit();
+err_stop_prod:
+    kmodring_producer_exit();
+err_free_mem:
+    if (global_ctx->is_dma)
+        kmodring_dma_free(total_size, global_ctx->ring_mem, global_ctx->dma_handle);
+    else
+        vfree(global_ctx->ring_mem);
 err_free_ctx:
     kfree(global_ctx);
     global_ctx = NULL;
@@ -264,8 +329,12 @@ err_free_ctx:
 static void __exit kmodring_exit(void)
 {
     misc_deregister(&kmodring_misc);
+    kmodring_sysfs_exit();
+    kmodring_producer_exit();
     if (global_ctx) {
-        if (global_ctx->ring_mem)
+        if (global_ctx->is_dma)
+            kmodring_dma_free(global_ctx->total_size, global_ctx->ring_mem, global_ctx->dma_handle);
+        else if (global_ctx->ring_mem)
             vfree(global_ctx->ring_mem);
         kfree(global_ctx);
         global_ctx = NULL;
