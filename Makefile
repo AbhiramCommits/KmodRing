@@ -23,5 +23,8 @@ kasan:
 
 clean:
 	$(MAKE) -C kernel clean
-	$(MAKE) -C user clean
+	$(Make) -C user clean
 	rm -rf results/*.txt results/*.csv results/*.json results/*.md
+
+ci: kunit selftest bench
+	@echo "All CI checks passed successfully."
