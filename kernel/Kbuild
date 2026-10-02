@@ -1,0 +1,4 @@
+# SPDX-License-Identifier: GPL-2.0
+obj-m := kmodring.o
+kmodring-y := kmodring_main.o kmodring_ring.o kmodring_dma.o kmodring_sysfs.o
+ccflags-y := -I$(src)/../include/uapi -std=gnu11 -Wno-declaration-after-statement
