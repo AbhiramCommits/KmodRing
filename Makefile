@@ -15,7 +15,8 @@ selftest:
 	bash tests/selftests/run_tests.sh
 
 bench:
-	@echo "Benchmarks not yet implemented"
+	bash scripts/run_bench.sh
+	bash scripts/collect_results.sh
 
 kasan:
 	bash scripts/run_kasan.sh

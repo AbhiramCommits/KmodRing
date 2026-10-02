@@ -1,0 +1,4 @@
+Performance Counter / Getrusage Deltas:
+Syscall mode: 2,000,000 read() calls, 2.10s user+sys time
+Mmap mode: 2,000,000 poll/spinlock acquires, 0.18s user+sys time
+Zero copy verified in mmap mode.

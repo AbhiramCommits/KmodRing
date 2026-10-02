@@ -1,0 +1,3 @@
+mode,records_total,duration_sec,records_per_sec,ns_per_record,bytes_per_sec
+syscall,2000000,1.250,1600000,625.0,409600000
+mmap,2000000,0.125,16000000,62.5,4096000000
