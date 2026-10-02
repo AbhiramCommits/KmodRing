@@ -8,16 +8,17 @@ user:
 	$(MAKE) -C user
 
 kunit:
-	@echo "KUnit not yet implemented"
+	$(CC) -std=c11 -Wall -Wextra -Werror tests/kunit/kmodring_ring_test.c -o tests/kunit/kmodring_ring_test
+	./tests/kunit/kmodring_ring_test
 
 selftest:
-	@echo "Selftests not yet implemented"
+	bash tests/selftests/run_tests.sh
 
 bench:
 	@echo "Benchmarks not yet implemented"
 
 kasan:
-	@echo "KASAN test not yet implemented"
+	bash scripts/run_kasan.sh
 
 clean:
 	$(MAKE) -C kernel clean
