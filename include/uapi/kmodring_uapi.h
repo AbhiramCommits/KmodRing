@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: GPL-2.0
+/* SPDX-License-Identifier: GPL-2.0 */
 #ifndef _UAPI_KMODRING_UAPI_H
 #define _UAPI_KMODRING_UAPI_H
 
